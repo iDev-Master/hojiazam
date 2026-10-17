@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Мини-касса</title>
+  <meta name="theme-color" content="#1f6f5c">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Вход по PIN -->
+  <div id="login" class="screen login">
+    <div class="login-box">
+      <div class="login-logo">🛒</div>
+      <h1 id="loginShop">Мини-касса</h1>
+      <div class="pin-dots" id="pinDots"></div>
+      <div class="login-error" id="loginError"></div>
+      <div class="keypad" id="keypad">
+        <button data-k="1">1</button><button data-k="2">2</button><button data-k="3">3</button>
+        <button data-k="4">4</button><button data-k="5">5</button><button data-k="6">6</button>
+        <button data-k="7">7</button><button data-k="8">8</button><button data-k="9">9</button>
+        <button data-k="back" class="muted">⌫</button><button data-k="0">0</button><button data-k="ok" class="ok">Войти</button>
+      </div>
+      <div class="login-net" id="loginNet"></div>
+    </div>
+  </div>
+
+  <!-- Приложение -->
+  <div id="app" class="screen hidden">
+    <header class="topbar">
+      <div class="brand" id="shopName">Магазин</div>
+      <nav class="tabs" id="tabs"></nav>
+      <button class="sync-badge" id="syncBadge" title="Отправить сейчас"></button>
+      <div class="who"><span id="userName"></span><button class="btn small" id="logoutBtn">Выйти</button></div>
+    </header>
+    <main id="view"></main>
+  </div>
+
+  <div id="modal" class="modal hidden"><div class="modal-box" id="modalBox"></div></div>
+  <div id="toasts" class="toasts"></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
