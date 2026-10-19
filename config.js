@@ -1,7 +1,7 @@
 // ⚙️ Единственный файл, который нужно отредактировать после установки.
 window.APP_CONFIG = {
   // Адрес веб-приложения Apps Script (Развернуть → Управление развёртываниями → URL, заканчивается на /exec)
-  API_URL: 'https://script.google.com/macros/s/ВАШ_ID_РАЗВЁРТЫВАНИЯ/exec',
+  API_URL: 'https://script.google.com/macros/s/AKfycbwqnwkUCZDamgH0w941kbUxydDfzWHhbJek6hC6u5PiXdcd27l3syFvksOononxd71z/exec',
 
   // Через сколько минут бездействия выходить из аккаунта
   IDLE_LOGOUT_MIN: { seller: 30, manager: 10, admin: 10 },
