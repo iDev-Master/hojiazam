@@ -1,6 +1,6 @@
 // Service Worker: приложение открывается без интернета.
 // При изменении файлов на GitHub увеличьте номер версии — тогда кэш обновится.
-const CACHE = 'mini-kassa-v2';
+const CACHE = 'mini-kassa-v6';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './config.js', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {

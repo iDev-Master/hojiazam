@@ -3,7 +3,7 @@
 
 const CFG = Object.assign({
   API_URL: '',
-  IDLE_LOGOUT_MIN: { seller: 30, manager: 10, admin: 10 },
+  AUTO_LOGOUT_MIN: 0,   // 0 — не выходить по бездействию (один человек на устройстве)
   SYNC_INTERVAL_SEC: 30,
   CATALOG_REFRESH_MIN: 5,
   PHOTO_MAX_PX: 600,
@@ -13,23 +13,37 @@ const CFG = Object.assign({
 const ROLE_LEVEL = { seller: 1, manager: 2, admin: 3 };
 const ROLE_RU = { seller: 'Продавец', manager: 'Менеджер', admin: 'Админ' };
 const TABS = [
-  ['kassa', 'Касса', 1],
-  ['products', 'Товары', 2],
-  ['purchases', 'Закупы', 2],
-  ['debts', 'Долги', 2],
-  ['report', 'Отчёт', 2],
-  ['settings', 'Настройки', 2],
+  // id, название, мин. роль, иконка на телефоне (null — на телефоне не показывать)
+  ['kassa', 'Касса', 1, 'cart'],
+  ['products', 'Товары', 2, null],
+  ['purchases', 'Закупы', 2, 'box'],
+  ['debts', 'Долги', 2, 'card'],
+  ['report', 'Отчёт', 2, 'chart'],
+  ['settings', 'Настройки', 2, 'more'],
 ];
+
+// Телефон определяется по ширине экрана; компьютерная версия не меняется
+const MQ = window.matchMedia('(max-width: 760px)');
+const isMobile = () => MQ.matches;
+const svg = (d) => `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const ICONS = {
+  cart: svg('<path d="M3 4h2l2.4 11.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 2-1.5L21 8H6"/><circle cx="10" cy="20" r="1.3"/><circle cx="17" cy="20" r="1.3"/>'),
+  box: svg('<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>'),
+  card: svg('<rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18M7 15h4"/>'),
+  chart: svg('<path d="M5 20V11M11 20V5M17 20v-6M3 20h18"/>'),
+  more: svg('<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>'),
+  scan: svg('<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M8 9v6M11 9v6M14 9v6M17 9v6"/>'),
+};
 
 const S = {
   user: null, token: null, cat: null, index: [],
   view: 'kassa', group: null, query: '',
-  cart: [], payment: 'Наличные', client: '', received: '',
-  purchase: { supplier: '', lines: [], paid: '', paidTouched: false },
+  cart: [], discount: 0, pay: null,   // discount — скидка на весь чек (сумма), pay — состояние экрана оплаты
+  purchase: { supplier: '', lines: [], paid: '', paidTouched: false, method: '' },
   debts: null, debtKind: 'Клиент',
   report: null, reportFrom: '', reportTo: '',
   prodQuery: '', prodGroup: '',
-  queue: 0, failed: 0, syncing: false, photoSyncing: false,
+  queue: 0, failed: 0, syncing: false, photoSyncing: false, cartOpen: false,
   lastActivity: Date.now(),
 };
 
@@ -51,9 +65,12 @@ function uid() {
   const r = crypto.getRandomValues(new Uint8Array(6));
   return Date.now().toString(36) + '-' + Array.from(r, (b) => b.toString(16).padStart(2, '0')).join('');
 }
+/** Номер чека: дата-время + 2 случайных знака, чтобы два чека в одну секунду не совпали. */
 function receiptNo(ts) {
   const d = new Date(ts);
-  return `${String(d.getFullYear()).slice(2)}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const r = crypto.getRandomValues(new Uint8Array(2));
+  const tail = Array.from(r, (b) => 'ABCDEFGHJKLMNPRSTUVWXYZ23456789'[b % 31]).join('');
+  return `${String(d.getFullYear()).slice(2)}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}-${tail}`;
 }
 /** Имя файла фото — так же, как на сервере: артикул (или ID группы) + .jpg */
 function photoName(key) {
@@ -96,8 +113,10 @@ function modal(html, onMount) {
   if (onMount) onMount($('#modalBox'));
 }
 function closeModal() {
+  const wasOpen = !$('#modal').classList.contains('hidden');
   $('#modal').classList.add('hidden');
   $('#modalBox').innerHTML = '';
+  if (wasOpen && S.user && S.view === 'kassa' && !isMobile() && $('#search')) $('#search').focus();
 }
 
 // ───────────────────────── Локальная база (IndexedDB) ─────────────────────────
@@ -143,6 +162,18 @@ const DB = (() => {
 // ───────────────────────── Сервер (Apps Script) ─────────────────────────
 
 async function api(action, data = {}, token = S.token) {
+  const body = { action, token, data };
+  // Тестовый режим (index.html открыт с диска): вместо Apps Script отвечает mock-api.js
+  const j = window.MockServer ? await window.MockServer.request(body) : await callServer(body);
+  if (!j.ok) {
+    const err = Object.assign(new Error(j.error || 'Ошибка сервера'), { code: j.code || 'ERR' });
+    if (err.code === 'AUTH' && action !== 'login' && S.user) setTimeout(() => logout('Сессия истекла — войдите снова'), 50);
+    throw err;
+  }
+  return j.data;
+}
+
+async function callServer(body) {
   if (!CFG.API_URL || CFG.API_URL.includes('ВАШ_ID')) {
     throw Object.assign(new Error('Не указан адрес Apps Script в config.js'), { code: 'CONFIG' });
   }
@@ -153,7 +184,7 @@ async function api(action, data = {}, token = S.token) {
     res = await fetch(CFG.API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },   // text/plain — без CORS-preflight
-      body: JSON.stringify({ action, token, data }),
+      body: JSON.stringify(body),
       signal: ctrl.signal,
     });
   } catch (e) {
@@ -161,16 +192,9 @@ async function api(action, data = {}, token = S.token) {
   } finally {
     clearTimeout(timer);
   }
-  let j;
-  try { j = await res.json(); } catch (e) {
+  try { return await res.json(); } catch (e) {
     throw Object.assign(new Error('Сервер ответил не так, как ожидалось. Проверьте, что веб-приложение открыто для «Все».'), { code: 'NET' });
   }
-  if (!j.ok) {
-    const err = Object.assign(new Error(j.error || 'Ошибка сервера'), { code: j.code || 'ERR' });
-    if (err.code === 'AUTH' && action !== 'login' && S.user) setTimeout(() => logout('Сессия истекла — войдите снова'), 50);
-    throw err;
-  }
-  return j.data;
 }
 
 // ───────────────────────── Фото: локальная папка или память браузера ─────────────────────────
@@ -298,7 +322,9 @@ function observePhotos(root) {
   $$('.ph[data-photo]', root).forEach((el) => (photoObserver ? photoObserver.observe(el) : loadPhoto(el)));
 }
 function phHtml(name, letter, cls = '') {
-  return `<div class="ph ${cls}" data-photo="${esc(name)}"><span class="ph-letter">${esc((letter || '?').charAt(0).toUpperCase())}</span></div>`;
+  let h = 0;
+  for (const c of String(letter || '')) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return `<div class="ph ${cls}" style="--h:${h}" data-photo="${esc(name)}"><span class="ph-letter">${esc((letter || '?').charAt(0).toUpperCase())}</span></div>`;
 }
 
 async function savePhoto(name, blob) {
@@ -311,6 +337,88 @@ async function orphanPhotos() {
   S.cat.groups.forEach((g) => { known.add(photoName(g.id)); if (g.photo) known.add(g.photo); });
   return (await Photos.list()).filter((n) => !known.has(n));
 }
+
+// ───────────────────────── Слои (кнопка «Назад» на телефоне) ─────────────────────────
+
+const Layers = [];
+let layerPopping = false, pendingPops = 0;
+function pushLayer(close) {
+  Layers.push(close);
+  history.pushState({ layer: Layers.length }, '');
+}
+function popLayer() { popLayers(1); }
+function popLayers(n) {
+  n = Math.min(n, Layers.length);
+  if (!n || layerPopping) return;
+  layerPopping = true;
+  pendingPops = n;
+  history.go(-n);
+}
+window.addEventListener('popstate', () => {
+  layerPopping = false;
+  let k = pendingPops || 1;
+  pendingPops = 0;
+  while (k-- > 0) { const close = Layers.pop(); if (close) close(); }
+});
+
+// ───────────────────────── Сканер штрих-кодов камерой (телефон) ─────────────────────────
+
+const Scanner = {
+  supported: 'BarcodeDetector' in window && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+  /** onCode(code) возвращает подпись найденного товара или null. continuous — сканировать подряд. */
+  async open({ continuous = false, onCode, title = 'Наведите камеру на штрих-код' }) {
+    let formats = [];
+    try { formats = await BarcodeDetector.getSupportedFormats(); } catch (e) { /* пусто */ }
+    const want = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'itf', 'codabar', 'qr_code'].filter((f) => formats.includes(f));
+    const det = new BarcodeDetector(want.length ? { formats: want } : undefined);
+    const ov = document.createElement('div');
+    ov.className = 'scan-ov';
+    ov.innerHTML = `<video playsinline muted></video><div class="scan-frame"></div>
+      <div class="scan-top"><span>${esc(title)}</span><button class="btn">${continuous ? 'Готово' : 'Закрыть'}</button></div>
+      <div class="scan-msg"></div>`;
+    document.body.appendChild(ov);
+    let stream = null, stopped = false;
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      ov.remove();
+    };
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    } catch (e) {
+      stop();
+      toast('Нет доступа к камере. Разрешите камеру для этого сайта в настройках браузера.', 'err');
+      return;
+    }
+    pushLayer(stop);
+    ov.querySelector('.scan-top button').onclick = popLayer;
+    const video = ov.querySelector('video');
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    const msg = ov.querySelector('.scan-msg');
+    let last = '', lastT = 0;
+    const loop = async () => {
+      if (stopped) return;
+      try {
+        const codes = video.readyState >= 2 ? await det.detect(video) : [];
+        if (codes.length) {
+          const code = codes[0].rawValue, now = Date.now();
+          if (code !== last || now - lastT > 2500) {
+            last = code; lastT = now;
+            const res = onCode(code);
+            if (navigator.vibrate) navigator.vibrate(res ? 40 : [40, 60, 40]);
+            msg.textContent = res ? '✓ ' + res : 'Не найден: ' + code;
+            msg.className = 'scan-msg ' + (res ? 'ok' : 'bad');
+            if (res && !continuous) { setTimeout(popLayer, 350); return; }
+          }
+        }
+      } catch (e) { /* кадр не распознан */ }
+      setTimeout(loop, 120);
+    };
+    loop();
+  },
+};
 
 // ───────────────────────── Каталог ─────────────────────────
 
@@ -375,6 +483,13 @@ async function updateQueueBadge() {
   S.queue = ops.length - S.failed;
   const b = $('#syncBadge');
   if (!b) return;
+  if (isMobile()) {
+    if (S.failed) { b.className = 'sync-badge error'; b.textContent = `⚠ ${S.failed}`; }
+    else if (S.queue) { b.className = 'sync-badge ' + (navigator.onLine ? 'pending' : 'offline'); b.textContent = `${navigator.onLine ? '⟳' : 'Офлайн'} ${S.queue}`; }
+    else if (!navigator.onLine) { b.className = 'sync-badge offline'; b.textContent = 'Офлайн ✓'; }
+    else { b.className = 'sync-badge ok'; b.textContent = '✓'; }
+    return;
+  }
   if (S.failed) { b.className = 'sync-badge error'; b.textContent = `⚠ Ошибки отправки: ${S.failed}`; }
   else if (S.queue && !navigator.onLine) { b.className = 'sync-badge offline'; b.textContent = `Офлайн · не отправлено: ${S.queue}`; }
   else if (S.queue) { b.className = 'sync-badge pending'; b.textContent = `⟳ Не отправлено: ${S.queue}`; }
@@ -434,7 +549,7 @@ async function doLogin(p) {
     if (r) return startSession(r.user, r.token);
     throw new Error(navigator.onLine
       ? 'Нет связи с сервером'
-      : 'Нет интернета. Без интернета могут войти только продавцы, которые уже входили на этом ноутбуке.');
+      : 'Нет интернета. Без интернета могут войти только продавцы, которые уже входили на этом устройстве.');
   } catch (e) {
     pin = '';
     renderPin();
@@ -465,6 +580,7 @@ async function offlineLogin(p) {
 async function startSession(user, token) {
   S.user = user;
   S.token = token;
+  DB.put('kv', { user, token }, 'session').catch(() => {});   // запомнить вход на этом устройстве
   S.lastActivity = Date.now();
   pin = '';
   renderPin();
@@ -486,10 +602,11 @@ async function startSession(user, token) {
   syncNow();
 }
 
-function logout(msg) {
-  // Перезагрузка страницы гарантированно стирает из памяти всё, что видел сотрудник.
+async function logout(msg) {
+  // Сессия забывается, страница перезагружается — из памяти стирается всё, что видел сотрудник.
   // Очередь продаж и справочник для кассы остаются в браузере.
   if (msg) sessionStorage.setItem('logoutMsg', msg);
+  try { await DB.del('kv', 'session'); } catch (e) { /* пусто */ }
   location.reload();
 }
 
@@ -497,14 +614,20 @@ function logout(msg) {
 
 function renderTabs() {
   const lvl = ROLE_LEVEL[S.user.role];
-  const tabs = TABS.filter((t) => lvl >= t[2]);
-  $('#tabs').innerHTML = tabs.length > 1
+  const mob = isMobile();
+  const tabs = TABS.filter((t) => lvl >= t[2] && (!mob || t[3]));
+  $('#tabs').innerHTML = !mob && tabs.length > 1
     ? tabs.map(([id, name]) => `<button data-tab="${id}" class="${S.view === id ? 'active' : ''}">${name}</button>`).join('')
     : '';
+  $('#bottomNav').innerHTML = mob && tabs.length > 1
+    ? tabs.map(([id, name, , ic]) => `<button data-tab="${id}" class="${S.view === id ? 'active' : ''}">${ICONS[ic]}<span>${id === 'settings' ? 'Ещё' : name}</span></button>`).join('')
+    : '';
+  document.body.classList.toggle('has-bottom-nav', mob && tabs.length > 1);
 }
 function go(view) {
   const t = TABS.find((x) => x[0] === view);
-  if (!t || ROLE_LEVEL[S.user.role] < t[2]) view = 'kassa';
+  if (!t || ROLE_LEVEL[S.user.role] < t[2] || (isMobile() && !t[3])) view = 'kassa';
+  $('main').scrollTop = 0;
   S.view = view;
   renderTabs();
   renderView();
@@ -516,6 +639,7 @@ function renderView() {
 // ───────────────────────── Касса ─────────────────────────
 
 function renderKassa() {
+  if (isMobile()) { renderKassaMobile(); return; }
   $('#view').innerHTML = `
     <div class="kassa">
       <section class="catalog">
@@ -533,6 +657,7 @@ function renderKassa() {
   inp.addEventListener('input', () => { S.query = inp.value; renderGrid(); });
   inp.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
+    if (!inp.value.trim()) { if (S.cart.length) openPayment(); return; }
     const p = findByCode(inp.value) || (searchProducts(inp.value).length === 1 ? searchProducts(inp.value)[0] : null);
     if (p) { addToCart(p); inp.value = ''; S.query = ''; renderGrid(); }
   });
@@ -592,25 +717,28 @@ function renderGrid() {
   }
   const active = S.cat.products.filter((p) => p.active !== false);
   const groupIds = new Set(S.cat.groups.map((g) => g.id));
+  const mob = isMobile();
+  const item = mob ? productRow : productTile;
+  grid.className = mob && (S.query.trim() || S.group) ? 'm-list' : 'grid';
 
   if (S.query.trim()) {
     const res = searchProducts(S.query);
     crumbs.innerHTML = `Найдено: <b>${res.length}</b>${res.length > 120 ? ' (показаны первые 120)' : ''}`;
-    grid.innerHTML = res.length ? res.slice(0, 120).map(productTile).join('') : '<div class="empty">Ничего не найдено</div>';
+    grid.innerHTML = res.length ? res.slice(0, 120).map(item).join('') : '<div class="empty">Ничего не найдено</div>';
   } else if (S.group) {
     const list = S.group === '__none'
       ? active.filter((p) => !groupIds.has(p.group))
       : active.filter((p) => p.group === S.group);
     list.sort((a, b) => a.name.localeCompare(b.name, 'ru'));
     crumbs.innerHTML = `<button class="btn small" id="backGroups">← Все группы</button> <b>${esc(S.group === '__none' ? 'Без группы' : groupName(S.group))}</b>`;
-    grid.innerHTML = list.length ? list.map(productTile).join('') : '<div class="empty">В этой группе нет товаров</div>';
-    $('#backGroups').addEventListener('click', () => { S.group = null; renderGrid(); $('#search').focus(); });
+    grid.innerHTML = list.length ? list.map(item).join('') : '<div class="empty">В этой группе нет товаров</div>';
+    $('#backGroups').addEventListener('click', () => { S.group = null; renderGrid(); if (!mob) $('#search').focus(); });
   } else {
     const counts = {};
     active.forEach((p) => { const k = groupIds.has(p.group) ? p.group : '__none'; counts[k] = (counts[k] || 0) + 1; });
     const groups = S.cat.groups.filter((g) => counts[g.id]);
     if (counts.__none) groups.push({ id: '__none', name: 'Без группы', photo: '' });
-    crumbs.innerHTML = 'Группы товаров';
+    crumbs.innerHTML = mob ? '' : 'Группы товаров';
     grid.innerHTML = groups.length
       ? groups.map((g) => `<button class="tile group" data-group="${esc(g.id)}">
           ${phHtml(g.photo || photoName(g.id), g.name)}
@@ -625,47 +753,207 @@ function renderGrid() {
 function addToCart(p) {
   const line = S.cart.find((l) => l.article === p.article);
   if (line) line.qty = round2(line.qty + 1);
-  else S.cart.push({ article: p.article, name: p.name, unit: p.unit, price: p.price, qty: 1 });
-  renderCart();
+  else S.cart.push({ article: p.article, name: p.name, unit: p.unit, price: p.price, basePrice: p.price, qty: 1 });
+  cartChanged(p.article);
 }
-function cartTotal() {
+/** Устанавливает количество (0 — убрать из чека). */
+function setQty(p, q) {
+  const i = S.cart.findIndex((l) => l.article === p.article);
+  if (q <= 0) { if (i >= 0) S.cart.splice(i, 1); }
+  else if (i >= 0) S.cart[i].qty = q;
+  else S.cart.push({ article: p.article, name: p.name, unit: p.unit, price: p.price, basePrice: p.basePrice ?? p.price, qty: q });
+  cartChanged(p.article);
+}
+function changeQty(article, delta) {
+  const line = S.cart.find((l) => l.article === article);
+  if (line) setQty(line, round2(line.qty + delta));
+}
+function cartChanged(article) {
+  renderCart();
+  if (isMobile() && article) refreshRow(article);
+}
+function productByArticle(a) {
+  return (S.cat && S.cat.products.find((x) => x.article === a)) || S.cart.find((l) => l.article === a);
+}
+/** Сумма по ценам продажи (после скидок на позиции, до скидки на чек). */
+function cartSubtotal() {
   return round2(S.cart.reduce((s, l) => s + round2(l.qty * l.price), 0));
+}
+/** Сумма по прайсу, без всяких скидок. */
+function cartGross() {
+  return round2(S.cart.reduce((s, l) => s + round2(l.qty * (l.basePrice ?? l.price)), 0));
+}
+/** К оплате. */
+function cartTotal() {
+  const sub = cartSubtotal();
+  if (S.discount > sub) S.discount = sub;
+  if (S.discount < 0 || !S.cart.length) S.discount = 0;
+  return round2(sub - S.discount);
+}
+function discountPct() {
+  const g = cartGross();
+  return g > 0 ? ((g - cartTotal()) / g) * 100 : 0;
+}
+/** Продавцу — не больше лимита из листа «Настройки»; менеджеру и админу без ограничений. */
+function discountAllowed() {
+  if (ROLE_LEVEL[S.user.role] >= 2) return true;
+  const lim = S.cat && S.cat.sellerMaxDiscount !== undefined ? Number(S.cat.sellerMaxDiscount) : 10;
+  return discountPct() <= lim + 0.001;
+}
+function discountLimitMsg() {
+  const lim = S.cat && S.cat.sellerMaxDiscount !== undefined ? Number(S.cat.sellerMaxDiscount) : 10;
+  return lim > 0 ? `Продавец может дать скидку не больше ${fmtN(lim)}% от суммы чека` : 'Продавец не может давать скидки';
+}
+/** Строки для записи: скидка на чек распределяется по позициям пропорционально сумме. */
+function saleItems() {
+  const sub = cartSubtotal();
+  const d = S.discount > 0 ? Math.min(S.discount, sub) : 0;
+  let left = d;
+  return S.cart.map((l, i) => {
+    const lineSum = round2(l.qty * l.price);
+    const share = i === S.cart.length - 1 ? round2(left) : (sub > 0 ? round2((d * lineSum) / sub) : 0);
+    left = round2(left - share);
+    return { article: l.article, name: l.name, unit: l.unit, qty: l.qty, price: l.price, basePrice: l.basePrice ?? l.price, sum: Math.max(0, round2(lineSum - share)) };
+  });
+}
+
+// ───────────────────────── Окна скидок ─────────────────────────
+
+/** Варианты округления вниз: 1011 → 1010, 1000. */
+function roundDownOptions(v) {
+  const out = [];
+  for (let step = 10; step <= v; step *= 10) {
+    const r = Math.floor(v / step) * step;
+    if (r < v && r >= v * 0.5 && !out.includes(r)) out.push(r);
+  }
+  return out.sort((a, b) => b - a).slice(0, 3);
+}
+
+/** Общее окно: задать новую сумму вместо base. apply(v) возвращает false, если нельзя. */
+function priceModal({ title, sub, base, value, apply, hint, label = 'Новая сумма' }) {
+  const quick = roundDownOptions(base).map((v) => ({ v, label: fmtN(v) }))
+    .concat([5, 10].map((pct) => ({ v: round2(base * (1 - pct / 100)), label: '−' + pct + '%' })));
+  modal(`<div class="dmod">
+      <h2>${esc(title)}</h2>
+      <p class="note">${sub}</p>
+      <label class="dm-l">${esc(label)}<input class="input dm-in" id="dmIn" inputmode="decimal" value="${value}"></label>
+      <div class="dm-quick">${quick.map((q) => `<button type="button" data-v="${q.v}">${q.label}</button>`).join('')}</div>
+      <div class="dm-res" id="dmRes"></div>
+      ${hint ? `<p class="note">${esc(hint)}</p>` : ''}
+      <div class="actions">
+        ${value < base ? '<button class="btn danger" id="dmReset" style="margin-right:auto">Убрать скидку</button>' : ''}
+        <button class="btn" data-close>Отмена</button><button class="btn primary" id="dmOk">Применить</button>
+      </div>
+    </div>`, (box) => {
+    const inp = $('#dmIn', box), res = $('#dmRes', box);
+    const draw = () => {
+      const v = num(inp.value), d = round2(base - v);
+      res.className = 'dm-res' + (v < 0 || v > base ? ' bad' : '');
+      res.textContent = v < 0 || v > base ? `Сумма должна быть от 0 до ${fmtN(base)}`
+        : d > 0 ? `Скидка: ${fmt(d)} (${fmtN(round2((d / base) * 100))}%)` : 'Без скидки';
+    };
+    draw();
+    inp.addEventListener('input', draw);
+    if (!isMobile()) { inp.focus(); inp.select(); }
+    $('.dm-quick', box).addEventListener('click', (e) => {
+      const b = e.target.closest('[data-v]');
+      if (b) { inp.value = b.dataset.v; draw(); }
+    });
+    const done = (v) => { if (apply(v) !== false) closeModal(); };
+    $('#dmOk', box).addEventListener('click', () => {
+      const v = round2(num(inp.value));
+      if (v < 0 || v > base) { toast(`Сумма должна быть от 0 до ${fmtN(base)}`, 'err'); return; }
+      done(v);
+    });
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#dmOk', box).click(); });
+    if ($('#dmReset', box)) $('#dmReset', box).addEventListener('click', () => done(base));
+  });
+}
+
+/** Скидка на позицию: новая цена за единицу. */
+function linePriceModal(line) {
+  const base = line.basePrice ?? line.price;
+  priceModal({
+    title: line.name,
+    sub: `Цена по прайсу: ${fmt(base)} за ${esc(line.unit)}. Укажите цену со скидкой за единицу.`,
+    base, value: line.price,
+    label: 'Цена за ' + line.unit + ' со скидкой',
+    hint: ROLE_LEVEL[S.user.role] < 2 ? discountLimitMsg() : '',
+    apply: (v) => {
+      const old = line.price;
+      line.price = v;
+      if (!discountAllowed()) { line.price = old; toast(discountLimitMsg(), 'err'); return false; }
+      cartChanged(line.article);
+      return true;
+    },
+  });
+}
+
+/** Скидка на весь чек: сумма к оплате. */
+function checkDiscountModal() {
+  const sub = cartSubtotal();
+  priceModal({
+    title: 'Скидка на чек',
+    sub: `Сумма чека: ${fmt(sub)}. Укажите, сколько клиент платит.`,
+    base: sub, value: cartTotal(),
+    label: 'К оплате',
+    hint: ROLE_LEVEL[S.user.role] < 2 ? discountLimitMsg() : '',
+    apply: (v) => {
+      const old = S.discount;
+      S.discount = round2(sub - v);
+      if (!discountAllowed()) { S.discount = old; toast(discountLimitMsg(), 'err'); return false; }
+      renderCart();
+      return true;
+    },
+  });
+}
+
+/** Строки «Без скидки / Скидка» над итогом. */
+function discountRowsHtml() {
+  const g = cartGross(), t = cartTotal();
+  if (g - t < 0.005) return '';
+  return `<div class="subrow"><span>Без скидки</span><s>${fmt(g)}</s></div>
+    <div class="subrow disc"><span>Скидка${S.discount ? ` (на чек −${fmtN(S.discount)})` : ''}</span><span>−${fmt(round2(g - t))}</span></div>`;
+}
+function linePriceHtml(l) {
+  const base = l.basePrice ?? l.price;
+  return `${esc(l.unit)} × ${l.price < base ? `<s>${fmtN(base)}</s> <b class="disc-price">${fmtN(l.price)}</b>` : fmtN(l.price)}`;
 }
 
 function renderCart() {
+  if (isMobile()) { renderCartMobile(); return; }
   const el = $('#cart');
   if (!el) return;
-  const total = cartTotal();
-  const clients = (S.cat && S.cat.clients) || [];
-  const change = num(S.received) - total;
+  const n = S.cart.length, total = cartTotal();
   el.innerHTML = `
-    <div class="cart-head"><span>Чек${S.cart.length ? ` · ${S.cart.length} поз.` : ''}</span>
-      ${S.cart.length ? '<button class="btn small" id="clearCart">Очистить</button>' : ''}</div>
+    <div class="cart-head"><span>Чек${n ? ` · ${n} поз.` : ''}</span>
+      ${n ? '<button class="btn small" id="clearCart">Очистить</button>' : ''}</div>
     <div class="cart-lines">
-      ${S.cart.length ? S.cart.map((l, i) => `
+      ${n ? S.cart.map((l, i) => `
         <div class="cl">
           <div class="cl-top"><span class="cl-name">${esc(l.name)}</span><button class="cl-del" data-del="${i}" title="Убрать">✕</button></div>
           <div class="cl-bottom">
             <div class="qty"><button data-minus="${i}">−</button><input data-qty="${i}" value="${l.qty}" inputmode="decimal"><button data-plus="${i}">+</button></div>
-            <span>${esc(l.unit)} × ${fmtN(l.price)}</span>
+            <button class="price-btn" data-price="${i}" title="Изменить цену / скидка">${linePriceHtml(l)}</button>
             <span class="cl-sum">${fmtN(round2(l.qty * l.price))}</span>
           </div>
         </div>`).join('') : '<div class="empty">Нажмите на товар или отсканируйте штрих-код</div>'}
     </div>
     <div class="cart-foot">
+      ${discountRowsHtml()}
       <div class="total"><span>Итого</span><b>${fmt(total)}</b></div>
-      <div class="seg">${['Наличные', 'Карта', 'В долг'].map((p) => `<button data-pay="${p}" class="${S.payment === p ? 'active' : ''}">${p}</button>`).join('')}</div>
-      ${S.payment === 'Наличные' ? `<div class="change">Получено <input class="input" id="received" inputmode="decimal" value="${esc(S.received)}">
-        <b>${S.received && change >= 0 ? 'Сдача: ' + fmt(round2(change)) : ''}</b></div>` : ''}
-      ${S.payment === 'В долг' ? `<input class="input" id="client" list="clientsList" placeholder="Клиент: имя или телефон" value="${esc(S.client)}">
-        <datalist id="clientsList">${clients.map((c) => `<option value="${esc(c)}">`).join('')}</datalist>` : ''}
-      <button class="btn primary big" id="sellBtn" ${S.cart.length ? '' : 'disabled'}>Продать</button>
+      ${n ? `<button class="link-btn" id="discBtn">${S.discount ? 'Скидка на чек −' + fmt(S.discount) + ' · изменить' : '% Скидка на чек'}</button>` : ''}
+      <button class="btn primary big" id="payBtn" ${n ? '' : 'disabled'}>Оплатить${n ? ' · ' + fmt(total) : ''}</button>
+      ${n ? '<div class="note center">Enter в пустом поиске — к оплате</div>' : ''}
     </div>`;
 
   el.onclick = (e) => {
     const t = e.target.closest('button');
     if (!t) return;
-    if (t.id === 'clearCart') { S.cart = []; S.received = ''; renderCart(); }
+    if (t.id === 'clearCart') { S.cart = []; S.discount = 0; renderCart(); }
+    else if (t.id === 'discBtn') checkDiscountModal();
+    else if (t.id === 'payBtn') openPayment();
+    else if (t.dataset.price) linePriceModal(S.cart[+t.dataset.price]);
     else if (t.dataset.del) { S.cart.splice(+t.dataset.del, 1); renderCart(); }
     else if (t.dataset.plus) { const l = S.cart[+t.dataset.plus]; l.qty = round2(l.qty + 1); renderCart(); }
     else if (t.dataset.minus) {
@@ -674,8 +962,6 @@ function renderCart() {
       if (S.cart[i].qty <= 0) S.cart.splice(i, 1);
       renderCart();
     }
-    else if (t.dataset.pay) { S.payment = t.dataset.pay; renderCart(); if ($('#client')) $('#client').focus(); }
-    else if (t.id === 'sellBtn') sell();
   };
   $$('[data-qty]', el).forEach((inp) => inp.addEventListener('change', () => {
     const i = +inp.dataset.qty;
@@ -683,40 +969,378 @@ function renderCart() {
     if (q <= 0) S.cart.splice(i, 1); else S.cart[i].qty = q;
     renderCart();
   }));
-  const rec = $('#received');
-  if (rec) rec.addEventListener('input', () => {
-    S.received = rec.value;
-    const ch = num(rec.value) - cartTotal();
-    rec.parentElement.querySelector('b').textContent = rec.value && ch >= 0 ? 'Сдача: ' + fmt(round2(ch)) : '';
-  });
-  const cl = $('#client');
-  if (cl) cl.addEventListener('input', () => { S.client = cl.value; });
 }
 
-async function sell() {
+// ───────────────────────── Оплата ─────────────────────────
+
+const DEBT = 'В долг';
+function payMethods() {
+  return S.cat && S.cat.payMethods && S.cat.payMethods.length ? S.cat.payMethods : ['Наличные'];
+}
+function payCalc() {
+  const total = cartTotal();
+  let paid = 0;
+  payMethods().forEach((m) => { paid += num(S.pay.amounts[m]); });
+  paid = round2(paid);
+  const debt = round2(num(S.pay.amounts[DEBT]));
+  const rest = round2(total - paid - debt);
+  const change = rest < 0 ? round2(-rest) : 0;
+  let error = '';
+  if (rest > 0.004) error = 'rest';
+  else if (change > 0 && debt > 0) error = 'Сумма больше чека — уменьшите долг или оплату';
+  else if (debt > 0 && !S.pay.client.trim()) error = 'Укажите клиента для долга';
+  return { total, paid, debt, rest, change, error };
+}
+
+/** Экран оплаты: несколько способов, сдача с выбором способа, остаток — в долг. */
+function openPayment() {
   if (!S.cart.length) return;
-  const client = S.client.trim();
-  if (S.payment === 'В долг' && !client) { toast('Укажите клиента для продажи в долг', 'err'); return; }
-  const btn = $('#sellBtn');
-  btn.disabled = true;
+  const methods = payMethods();
+  S.pay = { amounts: { [methods[0]]: String(cartTotal()) }, client: '', changeMethod: methods[0] };
+  const clients = (S.cat && S.cat.clients) || [];
+  const body = `
+    <div class="pay-total"><span>К оплате</span><b>${fmt(cartTotal())}</b></div>
+    <p class="note pay-hint">Нажмите на способ — он заберёт остаток. Можно разделить оплату между несколькими.</p>
+    <div class="pay-list">
+      ${methods.concat([DEBT]).map((m) => `<div class="pm${m === DEBT ? ' pm-debt' : ''}" data-m="${esc(m)}">
+        <button type="button" class="pm-name" data-fill="${esc(m)}">${esc(m)}</button>
+        <input class="pm-in" data-amt="${esc(m)}" inputmode="decimal" placeholder="0" autocomplete="off">
+      </div>`).join('')}
+      <div class="pay-client hidden" id="payClient">
+        <input class="input" id="payClientIn" list="payClients" placeholder="Клиент: имя или телефон" autocomplete="off">
+        <datalist id="payClients">${clients.map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
+      </div>
+    </div>
+    <div class="pay-cash" id="payCash"></div>
+    <div class="pay-sum" id="paySum"></div>`;
+  const foot = `<button class="btn primary big" id="payOk">Провести</button>`;
+  if (isMobile()) {
+    const ov = document.createElement('div');
+    ov.className = 'm-sheet pay-sheet';
+    ov.innerHTML = `<div class="m-sheet-head"><button class="m-icon" id="payBack" aria-label="Назад">‹</button><b>Оплата</b></div>
+      <div class="m-sheet-body pay">${body}</div><div class="m-sheet-foot">${foot}</div>`;
+    document.body.appendChild(ov);
+    pushLayer(() => ov.remove());
+    $('#payBack', ov).onclick = popLayer;
+    bindPay(ov);
+  } else {
+    modal(`<div class="pay"><h2>Оплата</h2>${body}<div class="pay-foot">${foot}</div></div>`, (box) => {
+      bindPay($('.pay', box));   // слушатели — на новом элементе, а не на постоянном окне
+      const first = $('.pm-in', box);
+      first.focus();
+      first.select();
+    });
+  }
+}
+
+function bindPay(root) {
+  const sel = (m) => $(`.pm-in[data-amt="${CSS.escape(m)}"]`, root);
+  const draw = () => updatePay(root);
+  draw();
+  root.addEventListener('input', (e) => {
+    const inp = e.target.closest('.pm-in');
+    if (inp) { S.pay.amounts[inp.dataset.amt] = inp.value; draw(); }
+    if (e.target.id === 'payClientIn') { S.pay.client = e.target.value; draw(); }
+  });
+  root.addEventListener('click', (e) => {
+    const f = e.target.closest('[data-fill]');
+    if (f) {
+      const m = f.dataset.fill, c = payCalc();
+      if (num(S.pay.amounts[m]) > 0) S.pay.amounts[m] = '';                 // повторное нажатие — убрать
+      else if (c.rest > 0) S.pay.amounts[m] = String(c.rest);               // забрать остаток
+      else { S.pay.amounts = { [m]: String(c.total) }; }                    // всё этим способом
+      draw();
+      if (m === DEBT && num(S.pay.amounts[DEBT]) > 0) $('#payClientIn', root).focus();
+      else if (!isMobile() && sel(m)) { sel(m).focus(); sel(m).select(); }
+      return;
+    }
+    const ch = e.target.closest('[data-cash]');
+    if (ch) { S.pay.amounts[payMethods()[0]] = ch.dataset.cash; draw(); return; }
+    const cm = e.target.closest('[data-chg]');
+    if (cm) { S.pay.changeMethod = cm.dataset.chg; draw(); return; }
+    if (e.target.closest('#payOk')) submitPayment();
+  });
+  root.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); submitPayment(); }
+  });
+}
+
+function updatePay(root) {
+  const c = payCalc(), methods = payMethods();
+  $$('.pm', root).forEach((row) => {
+    const m = row.dataset.m, inp = $('.pm-in', row);
+    if (document.activeElement !== inp) inp.value = S.pay.amounts[m] || '';
+    row.classList.toggle('on', num(S.pay.amounts[m]) > 0);
+  });
+  $('#payClient', root).classList.toggle('hidden', !(c.debt > 0));
+  // Быстрые суммы для первого способа (обычно наличные)
+  const cashM = methods[0];
+  const need = round2(c.total - (c.paid - num(S.pay.amounts[cashM])) - c.debt);
+  $('#payCash', root).innerHTML = num(S.pay.amounts[cashM]) > 0 && c.debt === 0 && need > 0
+    ? `<span class="note">${esc(cashM)}:</span>` + cashOptions(need).map((v) => `<button type="button" data-cash="${v}" class="${num(S.pay.amounts[cashM]) === v ? 'active' : ''}">${v === need ? 'Без сдачи' : fmtN(v)}</button>`).join('')
+    : '';
+  let sum;
+  if (c.error === 'rest') sum = `<div class="ps warn">Осталось внести <b>${fmt(c.rest)}</b></div>`;
+  else if (c.change > 0) {
+    sum = `<div class="ps chg">Сдача <b>${fmt(c.change)}</b></div>
+      <div class="chg-from"><span class="note">Выдать из:</span>${methods.map((m) => `<button type="button" data-chg="${esc(m)}" class="${S.pay.changeMethod === m ? 'active' : ''}">${esc(m)}</button>`).join('')}</div>`;
+    if (c.error) sum += `<div class="ps warn">${esc(c.error)}</div>`;
+  } else if (c.error) sum = `<div class="ps warn">${esc(c.error)}</div>`;
+  else sum = `<div class="ps ok">✓ Сумма сходится${c.debt > 0 ? ` · в долг ${fmt(c.debt)}` : ''}</div>`;
+  $('#paySum', root).innerHTML = sum;
+  const ok = $('#payOk', root);
+  ok.disabled = !!c.error;
+  ok.textContent = c.error ? 'Провести' : (c.change > 0 ? `Провести · сдача ${fmt(c.change)}` : `Провести · ${fmt(c.total)}`);
+}
+
+async function submitPayment() {
+  const c = payCalc();
+  if (c.error) { toast(c.error === 'rest' ? `Осталось внести ${fmt(c.rest)}` : c.error, 'err'); return; }
+  const payments = payMethods().filter((m) => num(S.pay.amounts[m]) > 0).map((m) => ({ method: m, amount: round2(num(S.pay.amounts[m])) }));
+  await sell({
+    payments,
+    debt: c.debt,
+    change: c.change > 0 ? { method: S.pay.changeMethod, amount: c.change } : null,
+    client: c.debt > 0 ? S.pay.client.trim() : '',
+  });
+}
+
+async function sell(pay) {
+  if (!S.cart.length) return;
+  const ok = $('#payOk');
+  if (ok) ok.disabled = true;
   const total = cartTotal();
   const ts = Date.now();
+  const receipt = receiptNo(ts);
   try {
     await enqueue('sale', {
-      receipt: receiptNo(ts),
-      payment: S.payment,
-      client: S.payment === 'В долг' ? client : '',
-      items: S.cart.map((l) => ({ article: l.article, name: l.name, unit: l.unit, qty: l.qty, price: l.price })),
+      receipt,
+      items: saleItems(),
+      discount: S.discount,
+      payments: pay.payments,
+      debt: pay.debt,
+      change: pay.change,
+      client: pay.client,
     });
-    if (client && S.cat && !S.cat.clients.includes(client)) S.cat.clients.push(client);
-    toast(`Чек ${receiptNo(ts)} на ${fmt(total)} сохранён`);
-    S.cart = []; S.payment = 'Наличные'; S.client = ''; S.received = '';
-    renderCart();
-    const s = $('#search'); if (s) s.focus();
   } catch (e) {
-    btn.disabled = false;
+    if (ok) ok.disabled = false;
     toast('Не удалось сохранить продажу: ' + e.message, 'err');
+    return;
   }
+  if (pay.client && S.cat && !S.cat.clients.includes(pay.client)) S.cat.clients.push(pay.client);
+  S.cart = []; S.discount = 0; S.pay = null;
+  if (isMobile()) {
+    popLayers(Layers.length);
+    renderGrid();
+    if (navigator.vibrate) navigator.vibrate(60);
+  } else closeModal();
+  renderCart();
+  saleDone({ receipt, total, change: pay.change, debt: pay.debt, client: pay.client, payments: pay.payments });
+}
+
+/** Экран «Продано»: крупно сумма и сдача. */
+function saleDone(r) {
+  modal(`<div class="done">
+      <div class="done-ic">✓</div>
+      <div class="done-t">Продано · ${fmt(r.total)}</div>
+      <div class="note">${r.payments.map((p) => `${esc(p.method)} ${fmtN(p.amount)}`).concat(r.debt > 0 ? [`в долг ${fmtN(r.debt)} (${esc(r.client)})`] : []).join(' + ')}</div>
+      ${r.change ? `<div class="done-chg"><span>Сдача</span><b>${fmt(r.change.amount)}</b><span>${esc(r.change.method)}</span></div>` : ''}
+      <button class="btn primary big" data-close id="doneOk">Новый чек</button>
+      <div class="note">Чек № ${esc(r.receipt)}</div>
+    </div>`, (box) => {
+    const id = String(Date.now());
+    $('.done', box).dataset.id = id;
+    $('#doneOk', box).focus();
+    if (!r.change) setTimeout(() => { if ($(`.done[data-id="${id}"]`)) closeModal(); }, 2500);
+  });
+}
+
+// ───────────────────────── Касса на телефоне ─────────────────────────
+
+function renderKassaMobile() {
+  $('#view').innerHTML = `
+    <div class="m-kassa">
+      <div class="m-search">
+        <input id="search" class="input" type="search" autocomplete="off" enterkeyhint="search"
+               placeholder="Название, артикул, штрих-код" value="${esc(S.query)}">
+        ${Scanner.supported ? `<button class="btn m-scan" id="scanBtn" aria-label="Сканировать камерой">${ICONS.scan}</button>` : ''}
+      </div>
+      <div class="crumbs" id="crumbs"></div>
+      <div id="grid"></div>
+    </div>
+    <div class="m-cartbar hidden" id="cartBar"></div>
+    <div class="m-sheet hidden" id="cartSheet"></div>`;
+  const inp = $('#search');
+  inp.addEventListener('input', () => { S.query = inp.value; renderGrid(); });
+  inp.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const p = findByCode(inp.value) || (searchProducts(inp.value).length === 1 ? searchProducts(inp.value)[0] : null);
+    if (p) { addToCart(p); inp.value = ''; S.query = ''; renderGrid(); }
+    inp.blur();
+  });
+  if ($('#scanBtn')) $('#scanBtn').addEventListener('click', () => Scanner.open({
+    continuous: true,
+    title: 'Сканируйте товары подряд',
+    onCode: (code) => { const p = findByCode(code); if (!p) return null; addToCart(p); return p.name; },
+  }));
+  $('#grid').addEventListener('click', (e) => {
+    const g = e.target.closest('.tile[data-group]');
+    if (g) { S.group = g.dataset.group; renderGrid(); $('main').scrollTop = 0; return; }
+    const row = e.target.closest('.m-row');
+    if (!row) return;
+    const p = productByArticle(row.dataset.article);
+    if (!p) return;
+    if (e.target.closest('[data-dec]')) changeQty(p.article, -1);
+    else if (e.target.closest('[data-qty]')) askQty(p);
+    else addToCart(p);
+    if (navigator.vibrate) navigator.vibrate(12);
+  });
+  $('#cartBar').addEventListener('click', openCartSheet);
+  $('#cartSheet').addEventListener('click', onCartSheetClick);
+  renderGrid();
+  renderCart();
+}
+
+function productRow(p) {
+  const line = S.cart.find((l) => l.article === p.article);
+  return `<div class="m-row${line ? ' in-cart' : ''}" data-article="${esc(p.article)}">
+    ${phHtml(photoName(p.article), p.name, 'thumb')}
+    <div class="m-row-main">
+      <div class="m-row-name">${esc(p.name)}</div>
+      <div class="m-row-sub"><b>${fmtN(p.price)}</b> / ${esc(p.unit)} · ${esc(p.article)}</div>
+    </div>
+    ${line
+      ? `<div class="m-step"><button data-dec aria-label="Меньше">−</button><button data-qty class="m-step-q">${fmtN(line.qty)}</button><button data-inc aria-label="Больше">+</button></div>`
+      : '<button class="m-add" data-inc aria-label="Добавить в чек">+</button>'}
+  </div>`;
+}
+function refreshRow(article) {
+  const p = productByArticle(article);
+  if (!p) return;
+  $$(`.m-row[data-article="${CSS.escape(article)}"]`).forEach((el) => {
+    const t = document.createElement('div');
+    t.innerHTML = productRow(p);
+    const n = t.firstElementChild;
+    el.replaceWith(n);
+    loadPhoto(n.querySelector('.ph'));
+  });
+}
+
+/** Окно ввода количества — удобно для товаров на вес (2,5 кг). */
+function askQty(p) {
+  const line = S.cart.find((l) => l.article === p.article);
+  let val = line ? String(line.qty).replace('.', ',') : '';
+  let fresh = true;
+  modal(`<div class="qpad">
+      <div class="qpad-name">${esc(p.name)}</div>
+      <div class="qpad-sub">${fmt(p.price)} за ${esc(p.unit)}</div>
+      <div class="qpad-val"><span id="qv"></span> <small>${esc(p.unit)}</small></div>
+      <div class="qpad-sum" id="qs"></div>
+      <div class="qpad-keys">${['1', '2', '3', '4', '5', '6', '7', '8', '9', ',', '0', '⌫'].map((k) => `<button data-qk="${k}">${k}</button>`).join('')}</div>
+      <div class="actions"><button class="btn" data-close>Отмена</button><button class="btn primary" id="qOk">Готово</button></div>
+    </div>`, (box) => {
+    const draw = () => {
+      $('#qv', box).textContent = val || '0';
+      $('#qs', box).textContent = '= ' + fmt(round2(num(val) * p.price));
+    };
+    draw();
+    $('.qpad-keys', box).addEventListener('click', (e) => {
+      const b = e.target.closest('[data-qk]');
+      if (!b) return;
+      const k = b.dataset.qk;
+      if (fresh && k !== '⌫') val = '';
+      fresh = false;
+      if (k === '⌫') val = val.slice(0, -1);
+      else if (k === ',') { if (!val.includes(',')) val = (val || '0') + ','; }
+      else if (val.replace(',', '').length < 7) val = (val === '0' ? '' : val) + k;
+      draw();
+    });
+    $('#qOk', box).addEventListener('click', () => { closeModal(); setQty(p, round2(num(val))); });
+  });
+}
+
+function openCartSheet() {
+  if (!S.cart.length || S.cartOpen) return;
+  S.cartOpen = true;
+  pushLayer(() => { S.cartOpen = false; renderCart(); });
+  renderCart();
+}
+function closeCartSheet() {
+  if (S.cartOpen) popLayer();
+}
+
+/** Варианты «получено» для быстрой кнопки: без сдачи и округления вверх. */
+function cashOptions(total) {
+  if (!(total > 0)) return [];
+  const s = Math.pow(10, Math.max(0, Math.floor(Math.log10(total)) - 1));
+  const opts = [total].concat([1, 5, 10, 50, 100].map((k) => Math.ceil(total / (s * k)) * s * k));
+  return [...new Set(opts)].filter((v) => v >= total).slice(0, 4);
+}
+
+function renderCartMobile() {
+  const bar = $('#cartBar');
+  if (!bar) return;
+  const n = S.cart.length, total = cartTotal();
+  bar.classList.toggle('hidden', !n);
+  bar.innerHTML = n ? `<button><span class="m-cb-n">${n}</span><span>Чек</span><b>${fmt(total)}</b><span class="m-cb-go">›</span></button>` : '';
+  const k = $('.m-kassa');
+  if (k) k.classList.toggle('with-bar', !!n);
+
+  const sh = $('#cartSheet');
+  if (!S.cartOpen || !n) {
+    sh.classList.add('hidden');
+    sh.innerHTML = '';
+    if (S.cartOpen && !n) closeCartSheet();
+    return;
+  }
+  sh.classList.remove('hidden');
+  const listScroll = $('.m-sheet-body', sh) ? $('.m-sheet-body', sh).scrollTop : 0;
+  sh.innerHTML = `
+    <div class="m-sheet-head">
+      <button class="m-icon" id="csClose" aria-label="Назад">‹</button>
+      <b>Чек · ${n} поз.</b>
+      <button class="btn small" id="csClear">Очистить</button>
+    </div>
+    <div class="m-sheet-body">
+      ${S.cart.map((l) => `<div class="m-cl" data-article="${esc(l.article)}">
+        <div class="m-cl-top"><span>${esc(l.name)}</span><button class="cl-del" data-del aria-label="Убрать">✕</button></div>
+        <div class="m-cl-bottom">
+          <div class="m-step"><button data-dec aria-label="Меньше">−</button><button data-qty class="m-step-q">${fmtN(l.qty)}</button><button data-inc aria-label="Больше">+</button></div>
+          <button class="price-btn note" data-price>${linePriceHtml(l)}</button>
+          <b>${fmtN(round2(l.qty * l.price))}</b>
+        </div>
+      </div>`).join('')}
+      <button class="link-btn m-disc" id="discBtn">${S.discount ? 'Скидка на чек −' + fmt(S.discount) + ' · изменить' : '% Скидка на чек'}</button>
+    </div>
+    <div class="m-sheet-foot">
+      ${discountRowsHtml()}
+      <button class="btn primary big" id="toPay">К оплате · ${fmt(total)}</button>
+    </div>`;
+  $('.m-sheet-body', sh).scrollTop = listScroll;
+}
+
+function onCartSheetClick(e) {
+  const t = e.target.closest('button');
+  if (!t) return;
+  if (t.id === 'csClose') { closeCartSheet(); return; }
+  if (t.id === 'toPay') { openPayment(); return; }
+  if (t.id === 'discBtn') { checkDiscountModal(); return; }
+  if (t.id === 'csClear') {
+    if (!confirm('Очистить чек?')) return;
+    S.cart = []; S.discount = 0;
+    renderGrid();
+    renderCart();
+    return;
+  }
+  const row = t.closest('.m-cl');
+  if (!row) return;
+  const line = S.cart.find((l) => l.article === row.dataset.article);
+  if (!line) return;
+  if (t.hasAttribute('data-del')) setQty(line, 0);
+  else if (t.hasAttribute('data-dec')) changeQty(line.article, -1);
+  else if (t.hasAttribute('data-inc')) changeQty(line.article, 1);
+  else if (t.hasAttribute('data-qty')) askQty(line);
+  else if (t.hasAttribute('data-price')) linePriceModal(line);
 }
 
 // Сканер штрих-кодов работает как клавиатура: быстрые цифры + Enter.
@@ -1001,6 +1625,23 @@ function renderPurchases() {
   const total = round2(P.lines.reduce((s, l) => s + round2(l.qty * l.price), 0));
   if (!P.paidTouched) P.paid = String(total);
   const suppliers = (S.cat && S.cat.suppliers) || [];
+  const mob = isMobile();
+  const linesHtml = mob
+    ? `<div class="m-lines">${P.lines.map((l, i) => `<div class="m-line">
+        <div class="m-line-top"><b>${esc(l.name)}</b><button class="cl-del" data-rm="${i}" aria-label="Убрать">✕</button></div>
+        <div class="m-line-f">
+          <label>Кол-во<input data-f="qty" data-i="${i}" value="${l.qty}" inputmode="decimal"></label>
+          <label>Цена закупки<input data-f="price" data-i="${i}" value="${l.price}" inputmode="decimal"></label>
+          <div class="m-line-sum">${fmtN(round2(l.qty * l.price))}</div>
+        </div></div>`).join('') || '<div class="empty">Добавьте товары через поиск или камеру</div>'}</div>`
+    : `<table class="tbl"><thead><tr><th>Товар</th><th class="num">Кол-во</th><th class="num">Цена закупки</th><th class="num">Сумма</th><th></th></tr></thead><tbody>
+        ${P.lines.map((l, i) => `<tr><td>${esc(l.name)} <span class="note">${esc(l.article)}</span></td>
+          <td class="num"><input class="n" data-f="qty" data-i="${i}" value="${l.qty}" inputmode="decimal"></td>
+          <td class="num"><input class="n" data-f="price" data-i="${i}" value="${l.price}" inputmode="decimal"></td>
+          <td class="num">${fmtN(round2(l.qty * l.price))}</td>
+          <td><button class="btn small danger" data-rm="${i}">✕</button></td></tr>`).join('')}
+        ${!P.lines.length ? '<tr><td colspan="5" class="empty">Добавьте товары через поиск выше</td></tr>' : ''}
+      </tbody></table>`;
   $('#view').innerHTML = `
     <div class="page">
       <h2>Новый закуп</h2>
@@ -1008,21 +1649,16 @@ function renderPurchases() {
         <div class="form">
           <label>Поставщик<input id="supplier" list="supList" value="${esc(P.supplier)}" placeholder="Название поставщика">
             <datalist id="supList">${suppliers.map((s) => `<option value="${esc(s)}">`).join('')}</datalist></label>
-          <label>Добавить товар<div class="dropdown"><input id="pSearch" placeholder="Название, артикул или штрих-код" autocomplete="off"><div class="dropdown-list hidden" id="pDrop"></div></div></label>
+          <label>Добавить товар<div class="m-psearch"><div class="dropdown"><input id="pSearch" placeholder="Название, артикул или штрих-код" autocomplete="off"><div class="dropdown-list hidden" id="pDrop"></div></div>
+            ${mob && Scanner.supported ? `<button type="button" class="btn m-scan" id="pScan" aria-label="Сканировать камерой">${ICONS.scan}</button>` : ''}</div></label>
         </div>
       </div>
-      <table class="tbl"><thead><tr><th>Товар</th><th class="num">Кол-во</th><th class="num">Цена закупки</th><th class="num">Сумма</th><th></th></tr></thead><tbody>
-        ${P.lines.map((l, i) => `<tr><td>${esc(l.name)} <span class="note">${esc(l.article)}</span></td>
-          <td class="num"><input class="n" data-f="qty" data-i="${i}" value="${l.qty}" inputmode="decimal"></td>
-          <td class="num"><input class="n" data-f="price" data-i="${i}" value="${l.price}" inputmode="decimal"></td>
-          <td class="num">${fmtN(round2(l.qty * l.price))}</td>
-          <td><button class="btn small danger" data-rm="${i}">✕</button></td></tr>`).join('')}
-        ${!P.lines.length ? '<tr><td colspan="5" class="empty">Добавьте товары через поиск выше</td></tr>' : ''}
-      </tbody></table>
+      ${linesHtml}
       <div class="box" style="margin-top:14px">
         <div class="form">
           <label>Итого<input readonly value="${fmt(total)}"></label>
           <label>Оплачено поставщику сейчас<input id="paid" inputmode="decimal" value="${esc(P.paid)}"></label>
+          <label>Чем оплатили<select id="pMethod">${payMethods().map((m) => `<option ${P.method === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select></label>
         </div>
         <p class="note">Если оплачено меньше итога, разница автоматически запишется в «Долги» как долг поставщику. Закупочные цены в справочнике обновятся.</p>
         <div class="actions"><button class="btn" id="pClear">Очистить</button><button class="btn primary" id="pSave" ${P.lines.length ? '' : 'disabled'}>Провести закуп</button></div>
@@ -1031,6 +1667,7 @@ function renderPurchases() {
 
   $('#supplier').addEventListener('input', (e) => { P.supplier = e.target.value; });
   $('#paid').addEventListener('input', (e) => { P.paid = e.target.value; P.paidTouched = true; });
+  $('#pMethod').addEventListener('change', (e) => { P.method = e.target.value; });
   const ps = $('#pSearch'), drop = $('#pDrop');
   ps.addEventListener('input', () => {
     const res = searchProducts(ps.value, false).slice(0, 10);
@@ -1049,8 +1686,18 @@ function renderPurchases() {
     renderPurchases();
   }));
   $$('[data-rm]').forEach((b) => b.addEventListener('click', () => { P.lines.splice(+b.dataset.rm, 1); renderPurchases(); }));
-  $('#pClear').addEventListener('click', () => { S.purchase = { supplier: '', lines: [], paid: '', paidTouched: false }; renderPurchases(); });
+  $('#pClear').addEventListener('click', () => { S.purchase = { supplier: '', lines: [], paid: '', paidTouched: false, method: '' }; renderPurchases(); });
   $('#pSave').addEventListener('click', savePurchase);
+  if ($('#pScan')) $('#pScan').addEventListener('click', () => Scanner.open({
+    continuous: true,
+    title: 'Сканируйте приход подряд',
+    onCode: (code) => {
+      const p = findByCode(code) || (S.cat && S.cat.products.find((x) => x.barcode === code || x.article === code));
+      if (!p) return null;
+      addPurchaseLine(p);
+      return p.name;
+    },
+  }));
 }
 
 function addPurchaseLine(p) {
@@ -1060,7 +1707,7 @@ function addPurchaseLine(p) {
   if (l) l.qty = round2(l.qty + 1);
   else P.lines.push({ article: p.article, name: p.name, qty: 1, price: p.cost || 0 });
   renderPurchases();
-  $('#pSearch').focus();
+  if (!isMobile()) $('#pSearch').focus();
 }
 
 async function savePurchase() {
@@ -1068,14 +1715,14 @@ async function savePurchase() {
   if (!P.supplier.trim()) { toast('Укажите поставщика', 'err'); return; }
   const lines = P.lines.filter((l) => l.qty > 0);
   if (!lines.length) return;
-  await enqueue('purchase', { supplier: P.supplier.trim(), paid: num(P.paid), items: lines });
+  await enqueue('purchase', { supplier: P.supplier.trim(), paid: num(P.paid), method: P.method || payMethods()[0], items: lines });
   lines.forEach((l) => {
     const p = S.cat.products.find((x) => x.article === l.article);
     if (p && l.price > 0) p.cost = l.price;
   });
   if (!S.cat.suppliers) S.cat.suppliers = [];
   if (!S.cat.suppliers.includes(P.supplier.trim())) S.cat.suppliers.push(P.supplier.trim());
-  S.purchase = { supplier: '', lines: [], paid: '', paidTouched: false };
+  S.purchase = { supplier: '', lines: [], paid: '', paidTouched: false, method: '' };
   toast('Закуп сохранён');
   renderPurchases();
 }
@@ -1108,8 +1755,14 @@ async function renderDebts(reload = true) {
   }
   const list = S.debts.filter((d) => d.kind === S.debtKind && Math.abs(d.balance) > 0.001);
   const sum = round2(list.reduce((s, d) => s + d.balance, 0));
-  $('#dList').innerHTML = `
-    <div class="cards"><div class="card"><div class="k">${S.debtKind === 'Клиент' ? 'Всего должны нам' : 'Всего должны мы'}</div><div class="v">${fmt(sum)}</div></div></div>
+  const head = `<div class="cards"><div class="card"><div class="k">${S.debtKind === 'Клиент' ? 'Всего должны нам' : 'Всего должны мы'}</div><div class="v">${fmt(sum)}</div></div></div>`;
+  if (isMobile()) {
+    $('#dList').innerHTML = head + `<div class="m-cards">${list.map((d) => `<div class="m-card">
+        <div class="m-card-top"><b>${esc(d.party)}</b><span class="${d.balance > 0 ? 'pos' : 'neg'}">${fmt(d.balance)}</span></div>
+        <div class="note">${d.last ? 'Последняя операция: ' + dateTime(d.last) : ''}</div>
+        <div class="m-card-act"><button class="btn primary" data-pay="${esc(d.party)}">Погашение</button><button class="btn" data-hist="${esc(d.party)}">История</button></div>
+      </div>`).join('') || '<div class="empty">Долгов нет</div>'}</div>`;
+  } else $('#dList').innerHTML = head + `
     <table class="tbl"><thead><tr><th>${S.debtKind === 'Клиент' ? 'Клиент' : 'Поставщик'}</th><th class="num">Долг</th><th>Последняя операция</th><th></th></tr></thead><tbody>
       ${list.map((d) => `<tr><td>${esc(d.party)}</td><td class="num ${d.balance > 0 ? 'pos' : 'neg'}">${fmtN(d.balance)}</td><td>${d.last ? dateTime(d.last) : ''}</td>
         <td style="text-align:right"><button class="btn small" data-pay="${esc(d.party)}">Погашение</button> <button class="btn small" data-hist="${esc(d.party)}">История</button></td></tr>`).join('')}
@@ -1133,14 +1786,19 @@ function debtForm(d) {
       <label class="wide">Контрагент<input name="party" list="dNames" value="${esc(d.party)}" required>
         <datalist id="dNames">${names.map((n) => `<option value="${esc(n)}">`).join('')}</datalist></label>
       <label>Сумма<input name="amount" inputmode="decimal" required></label>
-      <label>Комментарий<input name="comment"></label>
+      <label id="dMethodL">Способ<select name="method">${payMethods().map((m) => `<option>${esc(m)}</option>`).join('')}</select></label>
+      <label class="wide">Комментарий<input name="comment"></label>
       <div class="actions"><button type="button" class="btn" data-close>Отмена</button><button class="btn primary">Сохранить</button></div>
     </form>`, (box) => {
     $('[name=amount]', box).focus();
+    const opSel = $('[name=operation]', box);
+    const syncM = () => $('#dMethodL', box).classList.toggle('hidden', opSel.value !== 'Погашение');
+    opSel.addEventListener('change', syncM);
+    syncM();
     $('#dform', box).addEventListener('submit', async (e) => {
       e.preventDefault();
       const f = new FormData(e.target);
-      const data = { kind: f.get('kind'), operation: f.get('operation'), party: String(f.get('party')).trim(), amount: num(f.get('amount')), comment: String(f.get('comment')) };
+      const data = { kind: f.get('kind'), operation: f.get('operation'), party: String(f.get('party')).trim(), amount: num(f.get('amount')), method: f.get('method'), comment: String(f.get('comment')) };
       if (!data.party || !(data.amount > 0)) { toast('Укажите контрагента и сумму', 'err'); return; }
       await enqueue('debt', data);
       if (S.debts) {
@@ -1160,6 +1818,15 @@ async function debtHistory(kind, party) {
   modal(`<h2>${esc(party)}</h2><div class="empty">Загружаю…</div>`);
   try {
     const { history } = await api('debts', { kind, party });
+    if (isMobile()) {
+      modal(`<h2>${esc(party)}</h2>
+        <div class="m-cards">${history.map((h) => `<div class="m-card">
+          <div class="m-card-top"><b>${esc(h.operation)}</b><b class="${h.operation === 'Погашение' ? 'neg' : 'pos'}">${fmt(h.amount)}</b></div>
+          <div class="note">${h.date ? dateTime(h.date) : ''}${h.doc ? ' · ' + esc(h.doc) : ''}${h.by ? ' · ' + esc(h.by) : ''}</div>
+          ${h.comment ? `<div class="note">${esc(h.comment)}</div>` : ''}</div>`).join('') || '<div class="empty">Записей нет</div>'}</div>
+        <div class="actions"><button class="btn primary" data-close>Закрыть</button></div>`);
+      return;
+    }
     modal(`<h2>${esc(party)}</h2>
       <table class="tbl"><thead><tr><th>Дата</th><th>Операция</th><th class="num">Сумма</th><th>Документ</th><th>Комментарий</th><th>Кто</th></tr></thead><tbody>
       ${history.map((h) => `<tr><td>${h.date ? dateTime(h.date) : ''}</td><td>${esc(h.operation)}</td><td class="num">${fmtN(h.amount)}</td>
@@ -1216,19 +1883,29 @@ function drawReport() {
       <div class="card"><div class="k">Чеков</div><div class="v">${r.checksCount}</div></div>
       <div class="card"><div class="k">Средний чек</div><div class="v">${fmt(r.checksCount ? round2(r.total / r.checksCount) : 0)}</div></div>
       <div class="card"><div class="k">Прибыль (примерно)</div><div class="v">${fmt(r.profit)}</div></div>
+      <div class="card"><div class="k">Скидки</div><div class="v">${fmt(r.discount || 0)}</div></div>
     </div>
+    ${r.cashflow && Object.keys(r.cashflow).length ? `<h3>Деньги за период по способам</h3>
+      <p class="note">Продажи минус сдача, плюс погашения долгов, минус оплаты поставщикам.</p>
+      <table class="tbl"><tbody>${Object.entries(r.cashflow).sort((a, b) => b[1] - a[1]).map(([m, v]) => `<tr><td>${esc(m)}</td><td class="num"><b>${fmt(v)}</b></td></tr>`).join('')}</tbody></table>` : ''}
     <div class="two">
-      <div><h3>По способу оплаты</h3><table class="tbl"><tbody>${kv(r.byPay)}</tbody></table></div>
+      <div><h3>Продажи по способу оплаты</h3><table class="tbl"><tbody>${kv(r.byPay)}</tbody></table></div>
       <div><h3>По продавцам</h3><table class="tbl"><tbody>${kv(r.bySeller)}</tbody></table></div>
     </div>
+    ${r.discBySeller && Object.keys(r.discBySeller).length ? `<h3>Скидки по продавцам</h3><table class="tbl"><tbody>${kv(r.discBySeller)}</tbody></table>` : ''}
     <h3>Топ товаров</h3>
     <table class="tbl"><thead><tr><th>Товар</th><th class="num">Кол-во</th><th class="num">Сумма</th></tr></thead><tbody>
       ${r.top.map((p) => `<tr><td>${esc(p.name)} <span class="note">${esc(p.article)}</span></td><td class="num">${fmtN(p.qty)} ${esc(p.unit)}</td><td class="num">${fmtN(p.sum)}</td></tr>`).join('') || '<tr><td colspan="3" class="empty">Продаж нет</td></tr>'}
     </tbody></table>
     <h3>Чеки</h3>
-    <table class="tbl"><thead><tr><th>Время</th><th>№ чека</th><th>Продавец</th><th>Оплата</th><th>Клиент</th><th class="num">Поз.</th><th class="num">Сумма</th></tr></thead><tbody>
-      ${r.checks.map((c) => `<tr><td>${dateTime(c.time)}</td><td>${esc(c.receipt)}</td><td>${esc(c.seller)}</td><td>${esc(c.payment)}</td><td>${esc(c.client)}</td><td class="num">${c.lines}</td><td class="num">${fmtN(c.sum)}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">—</td></tr>'}
-    </tbody></table>
+    ${isMobile()
+      ? `<div class="m-cards">${r.checks.map((c) => `<div class="m-card">
+          <div class="m-card-top"><b>${fmt(c.sum)}</b><span class="note">${dateTime(c.time)}</span></div>
+          <div class="note">${esc(c.payment)}${c.client ? ' · ' + esc(c.client) : ''} · ${c.lines} поз. · ${esc(c.seller)} · № ${esc(c.receipt)}${c.discount > 0.005 ? ` · <span class="disc-txt">скидка ${fmtN(c.discount)}</span>` : ''}</div>
+        </div>`).join('') || '<div class="empty">Чеков нет</div>'}</div>`
+      : `<table class="tbl"><thead><tr><th>Время</th><th>№ чека</th><th>Продавец</th><th>Оплата</th><th>Клиент</th><th class="num">Поз.</th><th class="num">Скидка</th><th class="num">Сумма</th></tr></thead><tbody>
+      ${r.checks.map((c) => `<tr><td>${dateTime(c.time)}</td><td>${esc(c.receipt)}</td><td>${esc(c.seller)}</td><td>${esc(c.payment)}</td><td>${esc(c.client)}</td><td class="num">${c.lines}</td><td class="num">${c.discount > 0.005 ? fmtN(c.discount) : ''}</td><td class="num">${fmtN(c.sum)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">—</td></tr>'}
+    </tbody></table>`}
     <p class="note">Прибыль считается по текущей закупочной цене из справочника, поэтому она приблизительная.</p>`;
 }
 
@@ -1244,8 +1921,11 @@ async function renderSettings() {
   }[st];
   const ops = await DB.all('queue');
   const failed = ops.filter((o) => o.failed);
+  const mob = isMobile();
   $('#view').innerHTML = `
     <div class="page">
+      ${mob ? `<div class="box"><h3 style="margin-top:0">${esc(S.user.name)} · ${ROLE_RU[S.user.role]}</h3>
+        <p>Справочник товаров, группы и фото редактируются на компьютере.</p></div>` : `
       <div class="box">
         <h3 style="margin-top:0">Папка с фото на этом ноутбуке</h3>
         <p>${stText}</p>
@@ -1255,6 +1935,12 @@ async function renderSettings() {
           ${st === 'need-permission' ? '<button class="btn primary" id="sPerm">Разрешить доступ</button>' : ''}
           <button class="btn" id="sOrphans">Удалить фото без товаров</button>
         </div>
+      </div>`}
+      <div class="box">
+        <h3 style="margin-top:0">Способы оплаты</h3>
+        <p class="note">Как они будут на экране оплаты. Первый подставляется по умолчанию и для сдачи. «В долг» есть всегда.</p>
+        <div id="pmList"></div>
+        <div class="toolbar" style="margin:10px 0 0"><button class="btn" id="pmAdd">+ Добавить способ</button><button class="btn primary" id="pmSave">Сохранить</button></div>
       </div>
       <div class="box">
         <h3 style="margin-top:0">Отправка в Google Таблицу</h3>
@@ -1269,11 +1955,49 @@ async function renderSettings() {
         </div>
         <p class="note">Не очищайте данные браузера для этого сайта, пока здесь есть неотправленные операции.</p>
       </div>
+      ${mob ? '<button class="btn big" id="sLogout">Выйти</button>' : ''}
     </div>`;
+  if ($('#sLogout')) $('#sLogout').addEventListener('click', () => $('#logoutBtn').click());
   const after = async (fn) => { try { await fn(); } catch (e) { if (e.name !== 'AbortError') toast(e.message, 'err'); } renderSettings(); };
+  // Редактор способов оплаты
+  let pm = ((S.cat && S.cat.payMethodsAll) || payMethods().map((name) => ({ name, active: true }))).map((m) => ({ name: m.name, active: m.active !== false }));
+  const drawPm = () => {
+    $('#pmList').innerHTML = pm.map((m, i) => `<div class="pm-row">
+      <input class="input" data-pmn="${i}" value="${esc(m.name)}" placeholder="Название, например Алиф">
+      <label class="pm-act"><input type="checkbox" data-pma="${i}" ${m.active ? 'checked' : ''}> вкл.</label>
+      <button class="btn small" data-pmu="${i}" ${i ? '' : 'disabled'} aria-label="Выше">↑</button>
+      <button class="btn small" data-pmd="${i}" ${i < pm.length - 1 ? '' : 'disabled'} aria-label="Ниже">↓</button>
+      <button class="btn small danger" data-pmx="${i}" aria-label="Удалить">✕</button>
+    </div>`).join('') || '<div class="empty">Нет способов</div>';
+  };
+  drawPm();
+  $('#pmList').addEventListener('input', (e) => {
+    if (e.target.dataset.pmn !== undefined) pm[+e.target.dataset.pmn].name = e.target.value;
+  });
+  $('#pmList').addEventListener('change', (e) => {
+    if (e.target.dataset.pma !== undefined) pm[+e.target.dataset.pma].active = e.target.checked;
+  });
+  $('#pmList').addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    const sw = (i, j) => { [pm[i], pm[j]] = [pm[j], pm[i]]; drawPm(); };
+    if (b.dataset.pmu) sw(+b.dataset.pmu, +b.dataset.pmu - 1);
+    else if (b.dataset.pmd) sw(+b.dataset.pmd, +b.dataset.pmd + 1);
+    else if (b.dataset.pmx) { pm.splice(+b.dataset.pmx, 1); drawPm(); }
+  });
+  $('#pmAdd').addEventListener('click', () => { pm.push({ name: '', active: true }); drawPm(); $(`[data-pmn="${pm.length - 1}"]`).focus(); });
+  $('#pmSave').addEventListener('click', async () => {
+    if (!navigator.onLine) { toast('Изменять способы оплаты можно только при наличии интернета', 'err'); return; }
+    try {
+      await api('savePayMethods', { methods: pm.filter((m) => m.name.trim()) });
+      await refreshCatalog();
+      toast('Способы оплаты сохранены');
+      renderSettings();
+    } catch (e) { toast(e.message, 'err'); }
+  });
   if ($('#sPick')) $('#sPick').addEventListener('click', () => after(async () => { await Photos.pick(); toast('Папка подключена'); }));
   if ($('#sPerm')) $('#sPerm').addEventListener('click', () => after(() => Photos.reconnect()));
-  $('#sOrphans').addEventListener('click', () => after(async () => {
+  if ($('#sOrphans')) $('#sOrphans').addEventListener('click', () => after(async () => {
     if (navigator.onLine) await refreshCatalog();
     const list = await orphanPhotos();
     if (!list.length) { toast('Лишних фото нет'); return; }
@@ -1304,6 +2028,11 @@ async function init() {
   const msg = sessionStorage.getItem('logoutMsg');
   if (msg) { $('#loginError').textContent = msg; sessionStorage.removeItem('logoutMsg'); }
 
+  // Вход запомнен — сразу в кассу, без PIN
+  const sess = await DB.get('kv', 'session').catch(() => null);
+  const sp = sess && tokenPayload(sess.token);
+  if (sp && sp.exp > Date.now() && !msg) setTimeout(() => startSession(sess.user, sess.token), 0);
+
   const net = () => { $('#loginNet').textContent = navigator.onLine ? 'В сети' : 'Нет интернета — продажи сохраняются и отправятся позже'; };
   net();
 
@@ -1315,6 +2044,15 @@ async function init() {
     else if (e.key === 'Enter') loginKey('ok');
   });
   $('#tabs').addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) go(b.dataset.tab); });
+  $('#bottomNav').addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) go(b.dataset.tab); });
+  // Поворот экрана / смена ширины окна: перестроить под телефон или компьютер
+  MQ.addEventListener('change', () => {
+    if (!S.user) return;
+    if (S.cartOpen) { S.cartOpen = false; if (Layers.length) popLayer(); }
+    closeModal();
+    go(S.view);
+    updateQueueBadge();
+  });
   $('#logoutBtn').addEventListener('click', () => {
     if (S.cart.length && !confirm('В чеке есть товары. Выйти без продажи?')) return;
     logout();
@@ -1330,8 +2068,8 @@ async function init() {
   // Автовыход при бездействии
   setInterval(() => {
     if (!S.user) return;
-    const lim = (CFG.IDLE_LOGOUT_MIN[S.user.role] || 10) * 60000;
-    if (Date.now() - S.lastActivity > lim) logout('Выход по бездействию');
+    const lim = Number(CFG.AUTO_LOGOUT_MIN) * 60000;
+    if (lim > 0 && Date.now() - S.lastActivity > lim) logout('Выход по бездействию');
   }, 15000);
   setInterval(() => { if (S.user) syncNow(); }, CFG.SYNC_INTERVAL_SEC * 1000);
   setInterval(() => { if (S.user && S.view !== 'products') refreshCatalog(); }, CFG.CATALOG_REFRESH_MIN * 60000);
